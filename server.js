@@ -1,196 +1,202 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const fetch = require('node-fetch');
+const express  = require('express');
+const cors     = require('cors');
+const { exec } = require('child_process');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── SECURITY & MIDDLEWARE ────────────────────────────────────────────────────
-app.use(helmet());
-app.use(cors({
-  origin: '*', // Flutter app se allow karein
-  methods: ['GET', 'POST'],
-}));
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Rate limiting — abuse se bachao
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requests per 15 min per IP
-  message: { error: 'Too many requests, please try again later.' }
-});
-app.use('/api/', limiter);
-
-// ── PLATFORM DETECTION ───────────────────────────────────────────────────────
+// ─── PLATFORM DETECT ────────────────────────────────────────────────────────
 function detectPlatform(url) {
   const u = url.toLowerCase();
-  if (u.includes('tiktok.com') || u.includes('vm.tiktok') || u.includes('vt.tiktok')) return 'tiktok';
-  if (u.includes('youtube.com') || u.includes('youtu.be')) return 'youtube';
-  if (u.includes('instagram.com')) return 'instagram';
-  if (u.includes('twitter.com') || u.includes('x.com') || u.includes('t.co')) return 'twitter';
-  if (u.includes('facebook.com') || u.includes('fb.watch')) return 'facebook';
-  if (u.includes('reddit.com') || u.includes('redd.it')) return 'reddit';
-  return 'unknown';
+  if (u.includes('tiktok') || u.includes('vm.tiktok') || u.includes('vt.tiktok')) return 'TikTok';
+  if (u.includes('youtube') || u.includes('youtu.be'))  return 'YouTube';
+  if (u.includes('instagram'))                           return 'Instagram';
+  if (u.includes('twitter')  || u.includes('x.com'))    return 'Twitter/X';
+  if (u.includes('facebook') || u.includes('fb.watch')) return 'Facebook';
+  if (u.includes('reddit')   || u.includes('redd.it'))  return 'Reddit';
+  if (u.includes('vimeo'))                               return 'Vimeo';
+  if (u.includes('dailymotion'))                         return 'Dailymotion';
+  if (u.includes('twitch'))                              return 'Twitch';
+  if (u.includes('soundcloud'))                          return 'SoundCloud';
+  if (u.includes('pinterest'))                           return 'Pinterest';
+  if (u.includes('snapchat'))                            return 'Snapchat';
+  if (u.includes('linkedin'))                            return 'LinkedIn';
+  return 'Other';
 }
 
-// ── COBALT API CALL (Primary) ────────────────────────────────────────────────
-// Server side call — no CORS issue!
-async function callCobalt(videoUrl, options = {}) {
-  const instances = [
-    'https://api.cobalt.tools',
-    'https://cobalt.pussthecat.org',
-    'https://co.wuk.sh',
-  ];
-
-  for (const base of instances) {
-    try {
-      const res = await fetch(`${base}/api/json`, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          url: videoUrl,
-          vQuality: options.quality || '720',
-          aFormat: options.audioFormat || 'mp3',
-          isAudioOnly: options.audioOnly || false,
-          isNoTTWatermark: true,
-          isTTFullAudio: false,
-          isAudioMuted: false,
-          dubLang: false,
-          disableMetadata: false,
-        }),
-        timeout: 15000,
-      });
-
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data.status === 'error' || data.status === 'rate-limit') continue;
-      return { success: true, data, source: base };
-    } catch (e) {
-      console.warn(`Cobalt instance ${base} failed:`, e.message);
-      continue;
-    }
-  }
-  throw new Error('All cobalt instances failed');
+// ─── RUN YT-DLP ──────────────────────────────────────────────────────────────
+function ytdlp(args) {
+  return new Promise((resolve, reject) => {
+    exec(
+      `yt-dlp ${args}`,
+      { timeout: 60000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(stderr || err.message));
+        resolve(stdout.trim());
+      }
+    );
+  });
 }
 
-// ── FORMAT RESPONSE ──────────────────────────────────────────────────────────
-function formatResponse(data, platform, audioOnly) {
-  const links = [];
+// ─── FORMAT MAP ───────────────────────────────────────────────────────────────
+const FORMAT_MAP = {
+  'max':  'bestvideo+bestaudio/best',
+  '1080': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+  '720':  'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+  '480':  'bestvideo[height<=480]+bestaudio/best[height<=480]/best',
+  '360':  'bestvideo[height<=360]+bestaudio/best[height<=360]/best',
+  '144':  'bestvideo[height<=144]+bestaudio/best[height<=144]/best',
+};
 
-  if (['redirect', 'stream', 'tunnel'].includes(data.status)) {
-    links.push({
-      type: audioOnly ? 'audio' : 'video',
-      quality: audioOnly ? 'MP3' : 'Video',
-      url: data.url,
-      filename: audioOnly ? 'audio.mp3' : `${platform}_video.mp4`,
-    });
-  } else if (data.status === 'picker') {
-    (data.picker || []).forEach((item, i) => {
-      links.push({
-        type: item.type === 'photo' ? 'image' : 'video',
-        quality: item.type === 'photo' ? 'Image' : `Video ${i + 1}`,
-        url: item.url,
-        filename: item.type === 'photo' ? `image_${i+1}.jpg` : `video_${i+1}.mp4`,
-      });
-    });
-    if (data.audio) {
-      links.push({ type: 'audio', quality: 'Audio', url: data.audio, filename: 'audio.mp3' });
-    }
-  }
-
-  return links;
-}
-
-// ── ROUTES ───────────────────────────────────────────────────────────────────
-
-// Health check
-app.get('/', (req, res) => {
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+app.get('/', (_req, res) => {
   res.json({
-    app: 'SnapLoad Backend',
-    version: '1.0.0',
-    status: 'running',
-    endpoints: ['/api/download', '/api/info'],
+    app:      'SnapLoad Backend',
+    version:  '2.0.0',
+    engine:   'yt-dlp',
+    status:   'running',
+    supports: 'YouTube, TikTok, Instagram, Facebook, Twitter/X, Reddit, Vimeo, Dailymotion, SoundCloud, WhatsApp Status + 1000 more',
   });
 });
 
-// Main download endpoint
+// ─── GET VIDEO INFO ───────────────────────────────────────────────────────────
+// Returns title, thumbnail, duration, uploader — used for preview before download
+app.get('/api/info', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ success: false, error: 'URL required' });
+
+  try {
+    const raw  = await ytdlp(`--dump-json --no-playlist --no-warnings "${url}"`);
+    const info = JSON.parse(raw);
+    return res.json({
+      success:   true,
+      title:     info.title      || 'Untitled',
+      thumbnail: info.thumbnail  || '',
+      duration:  info.duration   || 0,
+      uploader:  info.uploader   || '',
+      platform:  detectPlatform(url),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── GET ALL AVAILABLE FORMATS ────────────────────────────────────────────────
+// Returns list of all formats user can choose from
+app.get('/api/formats', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ success: false, error: 'URL required' });
+
+  try {
+    const raw = await ytdlp(`--list-formats --no-warnings "${url}" 2>&1 || true`);
+    // Parse available heights
+    const heights  = new Set();
+    const lines    = raw.split('\n');
+    lines.forEach(line => {
+      const match = line.match(/(\d{3,4})p/);
+      if (match) heights.add(parseInt(match[1]));
+    });
+
+    const qualities = [];
+    [2160, 1440, 1080, 720, 480, 360, 240, 144].forEach(h => {
+      if (heights.has(h) || heights.size === 0) {
+        qualities.push({ label: `${h}p ${h >= 1080 ? 'FHD' : h >= 720 ? 'HD' : 'SD'}`, value: String(h) });
+      }
+    });
+
+    if (qualities.length === 0) {
+      qualities.push(
+        { label: '720p HD',  value: '720' },
+        { label: '480p SD',  value: '480' },
+        { label: '360p',     value: '360' },
+      );
+    }
+
+    return res.json({ success: true, platform: detectPlatform(url), qualities });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── MAIN DOWNLOAD ────────────────────────────────────────────────────────────
 app.post('/api/download', async (req, res) => {
   const { url, quality = '720', audioOnly = false, audioFormat = 'mp3' } = req.body;
 
-  // Validate
-  if (!url) {
-    return res.status(400).json({ success: false, error: 'URL required' });
-  }
-
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(url);
-  } catch {
+  // Validate URL
+  if (!url) return res.status(400).json({ success: false, error: 'URL required' });
+  try { new URL(url); } catch {
     return res.status(400).json({ success: false, error: 'Invalid URL' });
   }
 
   const platform = detectPlatform(url);
-  if (platform === 'unknown') {
-    return res.status(400).json({
-      success: false,
-      error: 'Platform not supported',
-      supported: ['tiktok', 'youtube', 'instagram', 'twitter', 'facebook', 'reddit'],
-    });
-  }
-
-  console.log(`[Download] Platform: ${platform} | Quality: ${quality} | Audio: ${audioOnly}`);
+  const links    = [];
 
   try {
-    const result = await callCobalt(url, { quality, audioOnly, audioFormat });
-    const links = formatResponse(result.data, platform, audioOnly);
+    if (audioOnly) {
+      // ── AUDIO ONLY ────────────────────────────────────────────────────────
+      const fmt = audioFormat === 'mp3' ? 'bestaudio[ext=mp3]/bestaudio/best' : 'bestaudio/best';
+      const out = await ytdlp(`--get-url --no-playlist --no-warnings -f "${fmt}" "${url}"`);
+      const audioUrl = out.split('\n').find(l => l.startsWith('http'));
+      if (!audioUrl) throw new Error('No audio URL found');
 
-    if (!links.length) {
-      return res.status(500).json({ success: false, error: 'No downloadable links found' });
+      links.push({
+        type:     'audio',
+        quality:  `Best Audio (${audioFormat.toUpperCase()})`,
+        url:      audioUrl,
+        filename: `audio.${audioFormat}`,
+      });
+
+    } else {
+      // ── VIDEO ─────────────────────────────────────────────────────────────
+      const fmt = FORMAT_MAP[quality] || FORMAT_MAP['720'];
+      const out = await ytdlp(`--get-url --no-playlist --no-warnings -f "${fmt}" "${url}"`);
+      const urls = out.split('\n').filter(l => l.startsWith('http'));
+      if (!urls.length) throw new Error('No video URL found');
+
+      links.push({
+        type:     'video',
+        quality:  quality === 'max' ? 'Best Quality' : `${quality}p`,
+        url:      urls[0],
+        filename: `video_${quality}p.mp4`,
+      });
+
+      // Always offer audio option alongside video
+      try {
+        const aOut = await ytdlp(`--get-url --no-playlist --no-warnings -f "bestaudio/best" "${url}"`);
+        const aUrl = aOut.split('\n').find(l => l.startsWith('http'));
+        if (aUrl) {
+          links.push({
+            type:     'audio',
+            quality:  'Audio Only (MP3)',
+            url:      aUrl,
+            filename: 'audio.mp3',
+          });
+        }
+      } catch (_) { /* audio is optional */ }
     }
 
-    return res.json({
-      success: true,
-      platform,
-      links,
-      count: links.length,
-    });
+    console.log(`[OK] ${platform} | quality:${quality} | audio:${audioOnly}`);
+    return res.json({ success: true, platform, links, count: links.length });
 
   } catch (err) {
-    console.error('[Download Error]', err.message);
+    console.error(`[ERR] ${platform} | ${err.message}`);
     return res.status(500).json({
       success: false,
-      error: 'Download failed. The video may be private or unavailable.',
+      error:   'Download failed. Video may be private or unavailable.',
       details: err.message,
     });
   }
 });
 
-// Info endpoint — just get video metadata (no download)
-app.get('/api/info', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ success: false, error: 'URL required' });
+// ─── 404 ─────────────────────────────────────────────────────────────────────
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
-  const platform = detectPlatform(url);
-  return res.json({
-    success: true,
-    platform,
-    supported: platform !== 'unknown',
-  });
-});
-
-// 404
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found' });
-});
-
-// ── START ────────────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ SnapLoad Backend running on port ${PORT}`);
-  console.log(`📡 API: http://localhost:${PORT}/api/download`);
+  console.log(`\n✅  SnapLoad Backend v2.0  —  port ${PORT}`);
+  console.log(`🎯  Engine: yt-dlp  |  1000+ sites supported\n`);
 });
